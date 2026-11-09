@@ -93,6 +93,7 @@
       <div class="ctl"><b>B / Y</b><span>Throw flashbang (2 per wave)</span></div>
       <div class="ctl"><b>Left stick · right stick</b><span>Move · snap turn. Push doors with your hand</span></div>
       <div class="ctl"><b>Left stick click</b><span>Front kick: smash a door open, stagger an enemy</span></div>
+      <div class="ctl"><b>Left grip next to them · E</b><span>Secure a hostage, zip-tie a suspect who surrendered</span></div>
     </div>
     <div class="btns">
       <button class="go" id="enterVR" disabled>Enter VR</button>
@@ -795,6 +796,7 @@ function onSqueeze(ctrl,down){
   const w=WEAPONS[state.weapon];
   if(hp.distanceTo(gun.localToWorld(w.magPt.clone()))<0.15){ reload(); pulse(ctrl,0.5,60); }
   else if(w.guard && hp.distanceTo(gun.localToWorld(w.guard.clone()))<0.22){ twoHand=true; pulse(ctrl,0.3,30); }
+  else interactNear(hp,0.7);   // grab a hostage / surrendered suspect within reach
 }
 function swapWeapon(){ if(state.over||!state.started) return; state.reloading=false; holdWeapon(state.weapon==='rifle'?'pistol':'rifle'); audioSwap(); if(gunCtrl) pulse(gunCtrl,0.4,50); }
 const _a=new V(), _b=new V(), _q1=new T.Quaternion(), _q2=new T.Quaternion(), _m4=new T.Matrix4(), _up2=new V(), _qr=new T.Quaternion(), _ex=new V(1,0,0);
@@ -980,22 +982,61 @@ function rigBones(inner){
   const b=n=>inner.getObjectByName('mixamorig'+n);
   return {hips:b('Hips'),spine:b('Spine'),spine1:b('Spine1'),spine2:b('Spine2'),neck:b('Neck'),head:b('Head'),headTop:b('HeadTop_End'),
     lArm:b('LeftArm'),lFore:b('LeftForeArm'),lHand:b('LeftHand'),lMid:b('LeftHandMiddle1'),rArm:b('RightArm'),rFore:b('RightForeArm'),rHand:b('RightHand'),rMid:b('RightHandMiddle1'),
-    lUp:b('LeftUpLeg'),lLeg:b('LeftLeg'),lFoot:b('LeftFoot'),rUp:b('RightUpLeg'),rLeg:b('RightLeg'),rFoot:b('RightFoot')};
+    lUp:b('LeftUpLeg'),lLeg:b('LeftLeg'),lFoot:b('LeftFoot'),lToe:b('LeftToeBase'),rUp:b('RightUpLeg'),rLeg:b('RightLeg'),rFoot:b('RightFoot'),rToe:b('RightToeBase')};
 }
 function rigHitboxes(B){
   const h=[];
   addHitbox(h,B.head,B.headTop,0.22,0.25,'head',0.22);
   addHitbox(h,B.spine,B.neck,0.4,0.28,'body'); addHitbox(h,B.hips,B.spine,0.37,0.26,'body',0.24);
-  for(const s of ['l','r']){ addHitbox(h,B[s+'Arm'],B[s+'Fore'],0.11,0.11,'body'); addHitbox(h,B[s+'Fore'],B[s+'Hand'],0.09,0.09,'body');
-    addHitbox(h,B[s+'Up'],B[s+'Leg'],0.17,0.17,'body'); addHitbox(h,B[s+'Leg'],B[s+'Foot'],0.12,0.13,'body'); }
+  for(const s of ['l','r']){ addHitbox(h,B[s+'Arm'],B[s+'Fore'],0.11,0.11,'arm'); addHitbox(h,B[s+'Fore'],B[s+'Hand'],0.09,0.09,'arm');
+    addHitbox(h,B[s+'Up'],B[s+'Leg'],0.17,0.17,'leg'); addHitbox(h,B[s+'Leg'],B[s+'Foot'],0.12,0.13,'leg'); }
   return h;
+}
+// bind/rest pose snapshot so procedural poses are applied from a clean base every frame (no accumulation)
+function captureRest(B){ const m=new Map(); for(const k in B){ const b=B[k]; if(b) m.set(b,{q:b.quaternion.clone(),p:b.position.clone()}); } return m; }
+function restoreRest(a){ for(const [b,r] of a.rest){ b.quaternion.copy(r.q); b.position.copy(r.p); } }
+function setWorldQuat(bone,q){ bone.parent.getWorldQuaternion(_qc).invert(); bone.quaternion.copy(_qc.multiply(q)); bone.updateMatrixWorld(true); }
+// legs: 'both' = kneeling on both knees, 'right' = one-knee firing stance (rear right knee down, left foot planted forward)
+function kneelLegs(a,mode,k){
+  const B=a.B; if(!B.lUp||!B.rUp||k<0.01) return 0;
+  if(a.kneelDrop===undefined){ const up=B.lUp.getWorldPosition(new V()), kn=B.lLeg.getWorldPosition(new V()); a.kneelDrop=Math.max(0.25,up.y-a.root.position.y-(up.distanceTo(kn)+0.1)); }
+  const drop=a.kneelDrop*k, base=a.root.position.y;
+  const animFeet={l:B.lFoot.getWorldPosition(new V()),r:B.rFoot.getWorldPosition(new V())};
+  const hp=B.hips.getWorldPosition(new V()); hp.y-=drop; B.hips.position.copy(B.hips.parent.worldToLocal(hp)); B.hips.updateMatrixWorld(true);
+  for(const s of ['l','r']){
+    const hipJ=B[s+'Up'].getWorldPosition(new V()), kneeDown=mode==='both'||s==='r';
+    const tgt=kneeDown?hipJ.clone().addScaledVector(_fw,-0.32):hipJ.clone().addScaledVector(_fw,0.42); tgt.y=base+(kneeDown?0.1:0.09);
+    const foot=animFeet[s].lerp(tgt,k);
+    const pole=kneeDown?_fw.clone().add(new V(0,-0.4,0)):_fw.clone().add(new V(0,0.5,0));
+    twoBoneIK(B[s+'Up'],B[s+'Leg'],B[s+'Foot'],foot,pole);
+    if(B[s+'Toe']) aimBone(B[s+'Foot'],B[s+'Toe'],B[s+'Foot'].getWorldPosition(new V()).addScaledVector(_fw,kneeDown?-0.12:0.15).add(new V(0,kneeDown?-0.05:-0.02,0)));
+  }
+  return drop;
+}
+// surrender / hostage pose on top of the current base pose: hands up (trembling) or kneeling with hands on the head
+function handsUpPose(a,kneel,onHead,tr){
+  const B=a.B, root=a.root; root.updateMatrixWorld(true); root.getWorldQuaternion(_rq); _rx.set(1,0,0).applyQuaternion(_rq); _fw.set(0,0,1).applyQuaternion(_rq);
+  if(kneel) kneelLegs(a,'both',1);
+  rotWorld(B.neck,_rx,kneel?0.38:0.26);
+  let L,Rr,pL,pR;
+  if(onHead){ const top=B.headTop.getWorldPosition(new V());
+    L=top.clone().addScaledVector(_rx,0.075).addScaledVector(_fw,-0.04).add(new V(0,-0.05,0)); Rr=top.clone().addScaledVector(_rx,-0.075).addScaledVector(_fw,-0.04).add(new V(0,-0.05,0));
+    pL=_rx.clone().addScaledVector(_fw,0.4); pR=_rx.clone().negate().addScaledVector(_fw,0.4); }
+  else { L=B.lArm.getWorldPosition(new V()).add(new V(0,0.43+tr,0)).addScaledVector(_rx,0.05).addScaledVector(_fw,0.06);
+    Rr=B.rArm.getWorldPosition(new V()).add(new V(0,0.43-tr,0)).addScaledVector(_rx,-0.05).addScaledVector(_fw,0.06);
+    pL=_rx.clone().add(new V(0,-0.2,0)).addScaledVector(_fw,0.3); pR=_rx.clone().negate().add(new V(0,-0.2,0)).addScaledVector(_fw,0.3); }
+  twoBoneIK(B.lArm,B.lFore,B.lHand,L,pL); twoBoneIK(B.rArm,B.rFore,B.rHand,Rr,pR);
+  if(B.lMid) aimBone(B.lHand,B.lMid,B.lHand.getWorldPosition(new V()).add(onHead?_rx.clone().multiplyScalar(-0.1):new V(0,0.1,0)));
+  if(B.rMid) aimBone(B.rHand,B.rMid,B.rHand.getWorldPosition(new V()).add(onHead?_rx.clone().multiplyScalar(0.1):new V(0,0.1,0)));
 }
 const RIFLE_GRIP_R=new V(0,-0.035,0.02), RIFLE_GRIP_L=new V(0,0.025,-0.31), RIFLE_MUZZLE=new V(0,0.055,-0.72);
 function soldierActor(){
   const g=MODELS.soldier, inner=skelClone(g.scene); inner.rotation.y=Math.PI;   // the model faces -Z
   const root=new T.Group(); root.rotation.order='YXZ'; root.add(inner);
   const mats=[];
-  inner.traverse(o=>{ if(o.isMesh){ o.material=o.material.clone(); mats.push(o.material); o.castShadow=true; o.receiveShadow=true; o.frustumCulled=false; } });
+  // interim look until real character models arrive: dull the tan sci-fi armour down to dark olive drab
+  const tint=[lin(0x6f735c),lin(0x5f6352),lin(0x7a7560)][(Math.random()*3)|0];
+  inner.traverse(o=>{ if(o.isMesh){ o.material=o.material.clone(); if(/Body/i.test(o.material.name)){ o.material.color.copy(tint); o.material.metalness=Math.min(o.material.metalness,0.25); } mats.push(o.material); o.castShadow=true; o.receiveShadow=true; o.frustumCulled=false; } });
   const B=rigBones(inner); root.updateMatrixWorld(true);
   const hits=rigHitboxes(B);
   const mixer=new T.AnimationMixer(inner), acts={}; for(const c of g.animations) acts[c.name]=mixer.clipAction(c);
@@ -1010,7 +1051,7 @@ function soldierActor(){
 }
 const _rq=new T.Quaternion(), _rx=new V(), _fw=new V();
 function soldierPose(a,dt,st){
-  let want=st.stun?'Idle':(st.moving?(st.speed>1.35?'Run':'Walk'):'Idle');
+  let want=(st.stun||st.surrender)?'Idle':(st.moving?(st.speed>1.35?'Run':'Walk'):'Idle');
   if(st.kick&&a.acts.Kick) want='Kick';
   if(want!==a.cur){ const to=a.acts[want]; to.reset(); if(want==='Kick') to.time=KICK_START; to.play();   // start after the clip's turn-in: bots already face the door
     a.acts[a.cur].crossFadeTo(to,(want==='Kick'||a.cur==='Kick')?0.15:0.22,false); a.cur=want; }
@@ -1018,18 +1059,26 @@ function soldierPose(a,dt,st){
   if(a.acts.Run) a.acts.Run.timeScale=Math.max(0.8,st.speed/3.2);
   a.mixer.update(dt);
   a.root.updateMatrixWorld(true);
-  a.aimK+=((st.stun?0:st.aim)-a.aimK)*Math.min(1,dt*6); const k=a.aimK;
   a.root.getWorldQuaternion(_rq); _rx.set(1,0,0).applyQuaternion(_rq); _fw.set(0,0,1).applyQuaternion(_rq);
   const B=a.B;
+  if(st.surrender){ handsUpPose(a,!!st.kneel,!!st.kneel,st.kneel?0:Math.sin(performance.now()*0.009)*0.015); return; }
+  a.aimK+=((st.stun?0:st.aim)-a.aimK)*Math.min(1,dt*6); const k=a.aimK;
+  // kneeling firing position: drop onto the right knee, left foot planted forward
+  a.crouchK=(a.crouchK||0)+(((st.crouch&&!st.moving&&a.cur!=='Kick')?1:0)-(a.crouchK||0))*Math.min(1,dt*5);
+  const drop=kneelLegs(a,'right',a.crouchK);
   // bladed stance: shoulders turned so the support hand reaches the handguard; head stays on target
   if(a.cur!=='Kick'){ rotWorld(B.spine2,UP,-(0.18+0.32*k)); rotWorld(B.neck,UP,0.18+0.32*k); }
   if(a.flinch>0){ a.flinch=Math.max(0,a.flinch-dt*6); rotWorld(B.spine1,_rx,-0.3*a.flinch); }
-  if(st.stun){ a.mount.position.set(-0.2,0.95,0.12); a.mount.rotation.x=1.25; }
-  else { a.mount.position.set(lerp(-0.14,-0.1,k),lerp(1.2,1.39,k),lerp(0.2,0.27,k)); a.mount.rotation.x=lerp(0.6,0.0,k); }
+  const rl=st.reload||0;   // 0..1 reload progress: rifle canted, support hand to the mag, to the vest, back
+  if(st.stun){ a.mount.position.set(-0.2,0.95-drop,0.12); a.mount.rotation.set(1.25,Math.PI,0); }
+  else { const cant=rl>0?Math.sin(Math.min(1,rl*1.2)*Math.PI)*0.55:0;
+    a.mount.position.set(lerp(-0.14,-0.1,k),lerp(1.2,1.39,k)-drop-cant*0.08,lerp(0.2,0.27,k)); a.mount.rotation.set(lerp(0.6,0.0,k)+cant*0.5,Math.PI,cant); }
   a.mount.updateMatrixWorld(true);
   let R,L;
   if(st.stun){ const hd=B.head.getWorldPosition(new V()).addScaledVector(_fw,0.13); R=hd.clone().addScaledVector(_rx,-0.06); L=hd.clone().addScaledVector(_rx,0.06); }
-  else { R=a.mount.localToWorld(RIFLE_GRIP_R.clone()); L=a.mount.localToWorld(RIFLE_GRIP_L.clone()); }
+  else { R=a.mount.localToWorld(RIFLE_GRIP_R.clone()); L=a.mount.localToWorld(RIFLE_GRIP_L.clone());
+    if(rl>0){ const well=a.mount.localToWorld(new V(0,-0.1,-0.09)), pouch=a.root.localToWorld(new V(0.06,1.12-drop,0.2));
+      L = rl<0.25 ? L.lerp(well,rl/0.25) : rl<0.5 ? well.lerp(pouch,(rl-0.25)/0.25) : rl<0.75 ? pouch.lerp(well,(rl-0.5)/0.25) : well.lerp(L,(rl-0.75)/0.25); } }
   const poleR=new V(-0.7,-1,-0.15).applyQuaternion(_rq), poleL=new V(0.5,-1,0.1).applyQuaternion(_rq);
   twoBoneIK(B.rArm,B.rFore,B.rHand,R,poleR); twoBoneIK(B.lArm,B.lFore,B.lHand,L,poleL);
   const gf=new V(0,0,-1).applyQuaternion(a.mount.getWorldQuaternion(new T.Quaternion()));
@@ -1042,15 +1091,12 @@ function civActor(){
   inner.traverse(o=>{ if(o.isMesh){ o.castShadow=true; o.receiveShadow=true; o.frustumCulled=false; } });
   const B=rigBones(inner); root.updateMatrixWorld(true);
   const hits=rigHitboxes(B);
-  const a={kind:'civ',root,hits,mats:[],B,t:Math.random()*10};
+  // half of the hostages stand with hands up, half kneel with hands on the head; securing one makes it kneel
+  const a={kind:'civ',root,hits,mats:[],B,t:Math.random()*10,rest:captureRest(B),kneel:Math.random()<0.5,secured:false};
   a.update=(dt)=>{
-    a.t+=dt; root.updateMatrixWorld(true); root.getWorldQuaternion(_rq); _rx.set(1,0,0).applyQuaternion(_rq);
-    const tr=Math.sin(a.t*9)*0.012;
-    rotWorld(B.neck,_rx,0.28);
-    const L=root.localToWorld(new V(0.17,1.7+tr,0.06)), Rr=root.localToWorld(new V(-0.17,1.7-tr,0.06));
-    twoBoneIK(B.lArm,B.lFore,B.lHand,L,new V(1,-0.2,0.3).applyQuaternion(_rq)); twoBoneIK(B.rArm,B.rFore,B.rHand,Rr,new V(-1,-0.2,0.3).applyQuaternion(_rq));
-    if(B.lMid) aimBone(B.lHand,B.lMid,B.lHand.getWorldPosition(new V()).add(new V(0,0.1,0)));
-    if(B.rMid) aimBone(B.rHand,B.rMid,B.rHand.getWorldPosition(new V()).add(new V(0,0.1,0)));
+    a.t+=dt; restoreRest(a);   // start from the bind pose every frame, so nothing accumulates (that was the spinning head)
+    const kneel=a.kneel||a.secured;
+    handsUpPose(a,kneel,kneel,(a.secured||kneel)?0:Math.sin(a.t*9)*0.012);
   };
   a.dispose=()=>{ scene.remove(root); };
   return a;
@@ -1099,8 +1145,90 @@ function fixKickClip(clip){
 }
 new FBXLoader().loadAsync('models/kick.fbx').then(f=>{ KICK_CLIP=fixKickClip(f.animations[0]); loadState.kick='yes'; showLoad(); }).catch(()=>{ loadState.kick='no'; showLoad(); });
 
+/* ============================== RAGDOLL (Verlet) ============================== */
+// 18 joint particles linked by bone-length and torso-bracing constraints. Gravity, the bullet's push, floor friction,
+// walls/furniture and a knee hinge rule; the skeleton is posed from the particles every frame until the body settles.
+const RJ=['hips','spine2','neck','headTop','lArm','lFore','lHand','rArm','rFore','rHand','lUp','lLeg','lFoot','lToe','rUp','rLeg','rFoot','rToe'];
+const RLINK=[[0,1],[1,2],[2,3],[2,4],[4,5],[5,6],[2,7],[7,8],[8,9],[0,10],[10,11],[11,12],[12,13],[0,14],[14,15],[15,16],[16,17],
+  [4,7],[10,14],[0,4],[0,7],[1,4],[1,7],[1,10],[1,14],[4,10],[7,14],[3,4],[3,7],[0,2],[1,3]];
+const RMIN=[[0,3,0.5],[10,12,0.3],[14,16,0.3],[4,6,0.17],[7,9,0.17],[10,13,0.38],[14,17,0.38],[6,9,0.12],[12,16,0.12]];
+const RRAD=[0.13,0.14,0.08,0.1,0.06,0.05,0.05,0.06,0.05,0.05,0.08,0.06,0.06,0.04,0.08,0.06,0.06,0.04];
+const _fa=new V(), _fb=new V(), _fc=new V(), _fm=new T.Matrix4();
+function frameQ(P,o,u,r,l){
+  _fb.set(P[u*3]-P[o*3],P[u*3+1]-P[o*3+1],P[u*3+2]-P[o*3+2]).normalize();
+  _fa.set(P[r*3]-P[l*3],P[r*3+1]-P[l*3+1],P[r*3+2]-P[l*3+2]); _fa.addScaledVector(_fb,-_fa.dot(_fb)).normalize();
+  _fc.crossVectors(_fa,_fb); _fm.makeBasis(_fa,_fb,_fc); return new T.Quaternion().setFromRotationMatrix(_fm);
+}
+function startRagdoll(c,dir,hitPoint,strength){
+  const B=c.actor.B; if(!B) return false;
+  const bones=RJ.map(k=>B[k]); if(bones.some(b=>!b)) return false;
+  c.actor.root.updateMatrixWorld(true);
+  const n=bones.length, P=new Float32Array(n*3), Q=new Float32Array(n*3), v=new V();
+  for(let i=0;i<n;i++){ bones[i].getWorldPosition(v); P[i*3]=v.x; P[i*3+1]=v.y; P[i*3+2]=v.z; }
+  const rest=RLINK.map(([i,j])=>Math.hypot(P[i*3]-P[j*3],P[i*3+1]-P[j*3+1],P[i*3+2]-P[j*3+2]));
+  const h=1/90, d=dir?new V(dir.x,Math.max(dir.y,-0.15),dir.z).normalize():new V(), hp=hitPoint||v.set(P[3],P[4],P[5]);
+  for(let i=0;i<n;i++){ const dd=(P[i*3]-hp.x)**2+(P[i*3+1]-hp.y)**2+(P[i*3+2]-hp.z)**2, k=strength*(0.3+Math.exp(-dd/0.1));
+    Q[i*3]=P[i*3]-d.x*k*h; Q[i*3+1]=P[i*3+1]-0.1*k*h; Q[i*3+2]=P[i*3+2]-d.z*k*h; }
+  const cx=P[0], cz=P[2];
+  const near=colliders.filter(b=>!b.off&&!b.door&&b.max.y>0.05&&b.min.x<cx+2.6&&b.max.x>cx-2.6&&b.min.z<cz+2.6&&b.max.z>cz-2.6);
+  c.rag={P,Q,rest,bones,near,h,t:0,still:0,awake:true,
+    hipsQ0:B.hips.getWorldQuaternion(new T.Quaternion()),chestQ0:B.spine2.getWorldQuaternion(new T.Quaternion()),F0h:frameQ(P,0,1,14,10),F0c:frameQ(P,1,2,7,4)};
+  return true;
+}
+function ragSatisfy(P,i,j,len,minOnly){
+  const ix=i*3, jx=j*3, dx=P[jx]-P[ix], dy=P[jx+1]-P[ix+1], dz=P[jx+2]-P[ix+2], d=Math.sqrt(dx*dx+dy*dy+dz*dz)||1e-6;
+  if(minOnly&&d>=len) return; const f=(d-len)/d*0.5;
+  P[ix]+=dx*f; P[ix+1]+=dy*f; P[ix+2]+=dz*f; P[jx]-=dx*f; P[jx+1]-=dy*f; P[jx+2]-=dz*f;
+}
+function ragKnee(P,hip,knee,foot,fwd){ // knees only bend forward
+  const mx=(P[hip*3]+P[foot*3])/2, my=(P[hip*3+1]+P[foot*3+1])/2, mz=(P[hip*3+2]+P[foot*3+2])/2;
+  const off=(P[knee*3]-mx)*fwd.x+(P[knee*3+1]-my)*fwd.y+(P[knee*3+2]-mz)*fwd.z;
+  if(off<0.03){ const k=0.03-off; P[knee*3]+=fwd.x*k; P[knee*3+1]+=fwd.y*k; P[knee*3+2]+=fwd.z*k; }
+}
+const _rf=new V(), _ru=new V(), _rs=new V();
+function stepRagdoll(c,dt){
+  const r=c.rag; if(!r.awake) return;
+  const P=r.P, Q=r.Q, n=r.bones.length, sub=Math.min(5,Math.max(1,Math.ceil(dt/r.h))), h=dt/sub, g=-9.8*h*h;
+  let maxV=0;
+  for(let s=0;s<sub;s++){
+    for(let i=0;i<n;i++){ const ix=i*3, x=P[ix], y=P[ix+1], z=P[ix+2];
+      P[ix]=x+(x-Q[ix])*0.985; P[ix+1]=y+(y-Q[ix+1])*0.985+g; P[ix+2]=z+(z-Q[ix+2])*0.985; Q[ix]=x; Q[ix+1]=y; Q[ix+2]=z; }
+    for(let it=0;it<6;it++){
+      for(let k=0;k<RLINK.length;k++) ragSatisfy(P,RLINK[k][0],RLINK[k][1],r.rest[k],false);
+      for(const m of RMIN) ragSatisfy(P,m[0],m[1],m[2],true);
+      _ru.set(P[3]-P[0],P[4]-P[1],P[5]-P[2]).normalize(); _rs.set(P[30]-P[42],P[31]-P[43],P[32]-P[44]); _rf.crossVectors(_rs,_ru).normalize();
+      ragKnee(P,10,11,12,_rf); ragKnee(P,14,15,16,_rf);
+      for(let i=0;i<n;i++){ const ix=i*3, rad=RRAD[i];
+        if(P[ix+1]<rad){ P[ix+1]=rad; Q[ix]+=(P[ix]-Q[ix])*0.4; Q[ix+2]+=(P[ix+2]-Q[ix+2])*0.4; }   // floor + friction
+        for(const b of r.near){ // push out of walls / furniture along the shallowest axis
+          const x=P[ix], y=P[ix+1], z=P[ix+2];
+          if(x<b.min.x-rad||x>b.max.x+rad||y<b.min.y-rad||y>b.max.y+rad||z<b.min.z-rad||z>b.max.z+rad) continue;
+          const pen=[x-(b.min.x-rad),(b.max.x+rad)-x,y-(b.min.y-rad),(b.max.y+rad)-y,z-(b.min.z-rad),(b.max.z+rad)-z];
+          let m=0; for(let q=1;q<6;q++) if(pen[q]<pen[m]) m=q;
+          if(m===0) P[ix]=b.min.x-rad; else if(m===1) P[ix]=b.max.x+rad; else if(m===2) P[ix+1]=b.min.y-rad; else if(m===3) P[ix+1]=b.max.y+rad; else if(m===4) P[ix+2]=b.min.z-rad; else P[ix+2]=b.max.z+rad;
+        }
+      }
+    }
+    if(s===sub-1) for(let i=0;i<n;i++){ const ix=i*3; maxV=Math.max(maxV,Math.hypot(P[ix]-Q[ix],P[ix+1]-Q[ix+1],P[ix+2]-Q[ix+2])/h); }
+  }
+  r.t+=dt; r.still=maxV<0.06?r.still+dt:0;
+  if(r.still>0.5||r.t>6) r.awake=false;
+  applyRagdoll(c);
+}
+function applyRagdoll(c){
+  const r=c.rag, B=c.actor.B, P=r.P, pt=i=>new V(P[i*3],P[i*3+1],P[i*3+2]);
+  setWorldQuat(B.hips,frameQ(P,0,1,14,10).multiply(r.F0h.clone().invert()).multiply(r.hipsQ0));
+  B.hips.position.copy(B.hips.parent.worldToLocal(pt(0))); B.hips.updateMatrixWorld(true);
+  aimBone(B.spine,B.spine2,pt(1));
+  setWorldQuat(B.spine2,frameQ(P,1,2,7,4).multiply(r.F0c.clone().invert()).multiply(r.chestQ0));
+  aimBone(B.neck,B.headTop,pt(3));
+  aimBone(B.lArm,B.lFore,pt(5)); aimBone(B.lFore,B.lHand,pt(6)); aimBone(B.rArm,B.rFore,pt(8)); aimBone(B.rFore,B.rHand,pt(9));
+  aimBone(B.lUp,B.lLeg,pt(11)); aimBone(B.lLeg,B.lFoot,pt(12)); aimBone(B.lFoot,B.lToe,pt(13));
+  aimBone(B.rUp,B.rLeg,pt(15)); aimBone(B.rLeg,B.rFoot,pt(16)); aimBone(B.rFoot,B.rToe,pt(17));
+}
+
 /* ============================== OPPOSING TEAM + HOSTAGES ============================== */
-const enemies=[], enemyMeshes=[], civs=[], corpses=[];
+const enemies=[], enemyMeshes=[], civs=[], corpses=[], prisoners=[];
 function pickSpot(list,minDist){ camera.getWorldPosition(_hp); const far=list.filter(s=>Math.hypot(s.x-_hp.x,s.z-_hp.z)>minDist), pool=far.length?far:list; return pool[(Math.random()*pool.length)|0]; }
 function reachableSpot(out){
   let path=null;
@@ -1114,7 +1242,8 @@ function spawnEnemy(){
   const e={actor,root:actor.root,hp:100,alive:true,flash:0,losT:0,los:false,lastHead:false,stunT:0,noPath:0,stepAcc:0,
     fireCd:1.6+Math.random()*1.6,strafe:Math.random()<0.5?-1:1,moveCd:1+Math.random()*2,speed:0.95+Math.random()*0.4,
     path:path||null,wp:0,repathT:0.6+Math.random()*0.4,stuckT:0,engageDist:7+Math.random()*5,deckSpot:null,
-    flankX:flank?(Math.random()<0.5?-3:3):0,flankZ:flank?(Math.random()-0.5)*4:0};
+    flankX:flank?(Math.random()<0.5?-3:3):0,flankZ:flank?(Math.random()-0.5)*4:0,
+    ammo:30,reloadT:0,burst:0,burstT:0,crouchPref:Math.random()<0.45,speedMul:1,accMul:1,surrender:false,arrested:false};
   for(const m of actor.hits){ m.userData.enemy=e; enemyMeshes.push(m); }
   enemies.push(e);
 }
@@ -1127,35 +1256,78 @@ function spawnCiv(){
 }
 function unhook(a){ for(const m of a.actor.hits){ const i=enemyMeshes.indexOf(m); if(i>=0) enemyMeshes.splice(i,1); } }
 function dropFromList(a,list){ const i=list.indexOf(a); if(i>=0) list.splice(i,1); }
-function killEnemy(e,dir){
-  if(!e.alive) return; e.alive=false; unhook(e); dropFromList(e,enemies);
-  audioBodyFall(e.root.position);
-  // face away from the shot so the body falls back along the bullet's path
-  if(dir){ e.root.rotation.y=Math.atan2(-dir.x,-dir.z); }
-  e.deathT=0; e.tiltZ=rr(-0.25,0.25); corpses.push(e);
-  // the rifle drops out of the hands and lands flat beside the body
+// the rifle drops out of the hands and lands flat beside the body
+function dropRifle(e){
+  if(e.droppedGun) return;
   const mount=e.actor.mount||e.actor.root.children.find(o=>o.children.includes(e.actor.muzzle));
-  if(mount){ const wp=mount.getWorldPosition(new V()); e.actor.root.remove(mount); scene.add(mount);
-    mount.position.set(wp.x+rr(-0.4,0.4),0.035,wp.z+rr(-0.4,0.4)); mount.rotation.set(0,rr(0,Math.PI*2),Math.PI/2); e.droppedGun=mount; }
+  if(!mount) return;
+  const wp=mount.getWorldPosition(new V()); e.actor.root.remove(mount); scene.add(mount);
+  mount.position.set(wp.x+rr(-0.4,0.4),0.035,wp.z+rr(-0.4,0.4)); mount.rotation.set(0,rr(0,Math.PI*2),Math.PI/2); e.droppedGun=mount;
+  audioClinkAt(mount.position);
+}
+function killEnemy(e,dir,hitPoint,strength){
+  if(!e.alive) return; e.alive=false; unhook(e); dropFromList(e,enemies); dropFromList(e,prisoners);
+  audioBodyFall(e.root.position); dropRifle(e);
+  e.deathT=0; e.tiltZ=rr(-0.25,0.25);
+  // real bodies go limp (ragdoll); the simple stand-ins keep the old stiff fall
+  if(!startRagdoll(e,dir,hitPoint,strength||2.2)&&dir) e.root.rotation.y=Math.atan2(-dir.x,-dir.z);
+  corpses.push(e);
   if(corpses.length>12){ const old=corpses.shift(); old.actor.dispose(); if(old.droppedGun) scene.remove(old.droppedGun); }
-  state.score+=e.lastHead?150:100; state.kills++; checkWaveEnd();
+  if(!e.surrender){ state.score+=e.lastHead?150:100; state.kills++; }
+  checkWaveEnd();
 }
 function updateCorpses(dt){
   for(const c of corpses){
+    if(c.rag){ stepRagdoll(c,dt); if(!c.pooled&&c.rag.t>1.1){ c.pooled=true; const P=c.rag.P; addPool(new V((P[0]+P[3])/2,0,(P[2]+P[5])/2),rr(1.1,1.6)); } continue; }
     if(c.deathT<2) c.deathT+=dt;
     const k=Math.min(1,c.deathT/0.55); c.root.rotation.x=-(k*k)*1.47; c.root.rotation.z=c.tiltZ*k;
     if(k>=1 && !c.pooled){ c.pooled=true; const back=new V(-Math.sin(c.root.rotation.y),0,-Math.cos(c.root.rotation.y));
       addPool(c.root.position.clone().addScaledVector(back,0.85),rr(1.1,1.6)); }
   }
 }
-function damageEnemy(e,dmg,hitPos,head,dir){
-  e.hp-=dmg; e.lastHead=head; e.actor.flinch=1; e.flash=1; bloodHit(hitPos,dir,head);
-  if(e.hp<=0) killEnemy(e,dir); else { audioHitGrunt(e.root.position); }
+// part: 'head' | 'body' | 'arm' | 'leg'. Limb hits do less damage but wound: legs make them limp, arms spoil their aim.
+function damageEnemy(e,dmg,hitPos,part,dir){
+  const head=part==='head';
+  if(e.surrender){ state.score-=150; showBanner('EXCESSIVE FORCE','-150 · the suspect had surrendered','#e2432f',2.4); bloodHit(hitPos,dir,head); killEnemy(e,dir,hitPos,2.4); return; }
+  e.hp-=dmg*((part==='arm'||part==='leg')?0.6:1); e.lastHead=head; e.actor.flinch=1; e.flash=1; bloodHit(hitPos,dir,head);
+  if(part==='leg') e.speedMul=Math.max(0.45,e.speedMul-0.25);
+  if(part==='arm') e.accMul=Math.max(0.4,e.accMul-0.2);
+  if(e.hp<=0) killEnemy(e,dir,hitPos,head?1.6:2.6);
+  else { audioHitGrunt(e.root.position); if(e.hp<50) maybeSurrender(e,0.35); }
+}
+// wounded or flashed at close range, some of them give up: rifle down, hands up. Secure them for points.
+function maybeSurrender(e,chance){
+  if(!e.alive||e.surrender||!e.actor.B) return;
+  camera.getWorldPosition(_hp); if(Math.hypot(e.root.position.x-_hp.x,e.root.position.z-_hp.z)>8||Math.random()>chance) return;
+  e.surrender=true; e.breach=null; e.stunT=0; dropRifle(e); dropFromList(e,enemies); prisoners.push(e);
+  showBanner('SUSPECT SURRENDERED','Secure him: left grip on him · E on desktop','#d4a24c',2.4);
+  checkWaveEnd();
+}
+// secure a hostage (+150) or arrest a surrendered suspect (+250): left grip next to them, or E on desktop
+function interactNear(pos,radius){
+  let best=null, bd=radius;
+  for(const c of civs){ if(c.secured) continue; const d=Math.hypot(c.root.position.x-pos.x,c.root.position.z-pos.z); if(d<bd){ bd=d; best=c; } }
+  for(const p of prisoners){ if(p.arrested) continue; const d=Math.hypot(p.root.position.x-pos.x,p.root.position.z-pos.z); if(d<bd){ bd=d; best=p; } }
+  if(!best) return false;
+  if(civs.includes(best)){ best.secured=true; best.actor.secured=true; state.score+=150; showBanner('HOSTAGE SECURED','+150','#7bc96f',2); }
+  else { best.arrested=true; state.score+=250; state.kills++; showBanner('SUSPECT ARRESTED','+250 · zip-tied','#7bc96f',2); }
+  audioZip(best.root.position); for(const c of controllers) pulse(c,0.5,60);
+  return true;
+}
+function clearPrisoners(){ prisoners.slice().forEach(p=>{ p.actor.dispose(); unhook(p); if(p.droppedGun) scene.remove(p.droppedGun); }); prisoners.length=0; }
+function updatePrisoners(dt){
+  camera.getWorldPosition(_hp);
+  for(const p of prisoners){
+    if(!p.arrested) p.root.rotation.y=lerpAngle(p.root.rotation.y,Math.atan2(_hp.x-p.root.position.x,_hp.z-p.root.position.z),Math.min(1,dt*3));
+    p.actor.update(dt,{moving:false,speed:0,aim:0,surrender:true,kneel:p.arrested});
+  }
 }
 function hitCiv(c,pos,dir){
   if(!c.alive) return; c.alive=false; unhook(c); dropFromList(c,civs);
   bloodHit(pos,dir,true); audioCivHit();
-  c.root.rotation.y=Math.atan2(-dir.x,-dir.z); c.deathT=0; c.tiltZ=rr(-0.2,0.2); corpses.push(c);
+  c.deathT=0; c.tiltZ=rr(-0.2,0.2);
+  if(!startRagdoll(c,dir,pos,2.2)) c.root.rotation.y=Math.atan2(-dir.x,-dir.z);
+  corpses.push(c);
   state.score-=250; state.hp-=20; damageFlash=1;
   showBanner('HOSTAGE HIT','-250 SCORE · -20 ARMOR','#e2432f',2.4);
   if(state.hp<=0){ state.hp=0; gameOver(); }
@@ -1168,6 +1340,7 @@ let yaw=0, pitch=0;
 function resetGame(){
   enemies.slice().forEach(e=>{ e.actor.dispose(); unhook(e); }); enemies.length=0;
   civs.slice().forEach(c=>{ c.actor.dispose(); unhook(c); }); civs.length=0;
+  clearPrisoners();
   corpses.forEach(c=>{ c.actor.dispose(); if(c.droppedGun) scene.remove(c.droppedGun); }); corpses.length=0;
   grenades.slice().forEach(g=>scene.remove(g.mesh)); grenades.length=0; clearBlood();
   Object.assign(state,{hp:100,ammo:{rifle:WEAPONS.rifle.mag,pistol:WEAPONS.pistol.mag},reloading:false,score:0,wave:0,kills:0,waveActive:false,over:false,pending:0,nextWaveT:0,flashbangs:FB_MAX});
@@ -1184,6 +1357,7 @@ function checkWaveEnd(){
   if(state.waveActive&&state.pending===0&&enemies.length===0){
     state.waveActive=false; const saved=civs.length;
     civs.slice().forEach(c=>{ c.actor.dispose(); unhook(c); }); civs.length=0;
+    clearPrisoners();
     state.score+=saved*100; state.hp=Math.min(100,state.hp+25);
     showBanner('HOUSE CLEAR',(saved?saved+' HOSTAGE'+(saved>1?'S':'')+' SAFE +'+saved*100+' · ':'')+'+25 ARMOR','#7bc96f',3);
     state.nextWaveT=4.5;
@@ -1277,7 +1451,7 @@ function fireOnce(ctrl){
   if(hits.length&&hits[0].distance<=wall){
     const h=hits[0], o=h.object, head=o.userData.part==='head';
     if(o.userData.civ) hitCiv(o.userData.civ,h.point,dir);
-    else if(o.userData.enemy&&o.userData.enemy.alive) damageEnemy(o.userData.enemy,head?w.dmgHead:w.dmgBody,h.point,head,dir);
+    else if(o.userData.enemy&&o.userData.enemy.alive) damageEnemy(o.userData.enemy,head?w.dmgHead:w.dmgBody,h.point,o.userData.part||'body',dir);
     end=h.point.clone();
   } else if(wall<70){ end=pos.clone().addScaledVector(dir,wall); spawnImpact(end,0xd9d2c0,6); }
   else end=pos.clone().addScaledVector(dir,60);
@@ -1393,9 +1567,10 @@ function updateEnemies(dt){
     const g=e.root, p=g.position;
     if(e.flash>0) e.flash=Math.max(0,e.flash-dt*5);
     for(const m of e.actor.mats) if(m.emissive) m.emissive.setRGB(e.flash*0.6,e.flash*0.08,e.flash*0.05);
-    if(e.stunT>0){ e.stunT-=dt; e.breach=null; g.rotation.y+=Math.sin(performance.now()*0.008)*dt*2; e.los=false; e.losT=0; e.actor.update(dt,{moving:false,speed:0,aim:0,stun:true}); continue; }
+    if(e.stunT>0){ e.stunT-=dt; e.breach=null; g.rotation.y+=Math.sin(performance.now()*0.008)*dt*2; e.los=false; e.losT=0; e.actor.update(dt,{moving:false,speed:0,aim:0,stun:true});
+      if(e.stunT<=0) maybeSurrender(e,0.4); continue; }
     e.losT-=dt;
-    if(e.losT<=0){ e.losT=0.2; _ep.set(p.x,1.55,p.z); const was=e.los; e.los=hasLOS(_ep,head); if(!was&&e.los) e.fireCd=Math.max(e.fireCd,0.45+Math.random()*0.5); }
+    if(e.losT<=0){ e.losT=0.2; _ep.set(p.x,1.55-(e.actor.crouchK||0)*(e.actor.kneelDrop||0.4),p.z); const was=e.los; e.los=hasLOS(_ep,head); if(!was&&e.los) e.fireCd=Math.max(e.fireCd,0.45+Math.random()*0.5); }
     if(e.breach){   // kicking a door in: hold position, face the door, foot lands KICK_HIT into the clip
       const b=e.breach; b.t+=dt; g.rotation.y=lerpAngle(g.rotation.y,b.yaw,Math.min(1,dt*10));
       if(!b.kicked&&b.t>=b.hitT){ b.kicked=true; kickDoor(b.door,p); }
@@ -1421,9 +1596,10 @@ function updateEnemies(dt){
     e.repathT-=dt;
     if(e.repathT<=0||!e.path){ e.repathT=0.9+Math.random()*0.6; const goal=enemyGoal(e,head), pth=findPath(p.x,p.z,goal.x,goal.z);
       if(pth===null&&!e.los){ if(++e.noPath>3){ e.noPath=0; reachableSpot(p); } } else e.noPath=0; e.path=pth||[]; e.wp=0; }
-    let move=null, face=null, speed=e.speed; const engaging=e.los&&dist<e.engageDist;
+    let move=null, face=null, speed=e.speed*e.speedMul; const engaging=e.los&&dist<e.engageDist, kneeling=engaging&&e.crouchPref;
     if(engaging){ face=toP; e.moveCd-=dt; if(e.moveCd<=0){ e.strafe*=-1; e.moveCd=0.9+Math.random()*1.4; }
-      const f=toP.clone().normalize(), side=new V(-f.z*e.strafe,0,f.x*e.strafe); if(walkable(p.x+side.x*0.6,p.z+side.z*0.6)) move=side; else e.strafe*=-1; speed=e.speed*0.55; }
+      const f=toP.clone().normalize(), side=new V(-f.z*e.strafe,0,f.x*e.strafe);
+      if(!kneeling){ if(walkable(p.x+side.x*0.6,p.z+side.z*0.6)) move=side; else e.strafe*=-1; } speed*=0.55; }
     else if(e.wp<e.path.length){ const w=e.path[e.wp]; move=new V(w.x-p.x,0,w.z-p.z); if(move.length()<0.35){ e.wp++; move=null; } else move.normalize(); face=e.los?toP:move; if(!e.los) speed*=1.25; }
     else if(e.los) face=toP;
     else if(e.flankX||e.flankZ){ e.flankX=0; e.flankZ=0; e.repathT=0; }   // flank point reached but no sight: go straight for the player
@@ -1436,18 +1612,25 @@ function updateEnemies(dt){
     if(face&&face.lengthSq()>1e-6) g.rotation.y=lerpAngle(g.rotation.y,Math.atan2(face.x,face.z),Math.min(1,dt*8));
     const moving=moved>0.0005;
     e.stepAcc+=moved; if(e.stepAcc>(speed>1.35?0.95:0.72)){ e.stepAcc=0; audioStep(p,speed>1.35); }
-    e.actor.update(dt,{moving,speed:moving?moved/dt:0,aim:(e.los&&dist<22)?1:0,stun:false});
+    if(e.reloadT>0){ e.reloadT-=dt; if(e.reloadT<=0) e.ammo=30; }
+    e.actor.update(dt,{moving,speed:moving?moved/dt:0,aim:(e.los&&dist<22)?1:0,stun:false,crouch:kneeling,reload:e.reloadT>0?1-e.reloadT/2.4:0});
+    // short bursts from a 30-round mag; an empty mag means a 2.4 s reload you can push into
     e.fireCd-=dt;
-    if(e.fireCd<=0&&e.los&&dist<26&&!state.over&&e.actor.muzzle){
-      e.fireCd=1.3+Math.random()*2.0;
-      const mz=new V(); e.actor.muzzle.getWorldPosition(mz);
-      const hit=Math.random()<Math.max(0.15,0.5-dist*0.012+state.wave*0.012-(moving?0.08:0));
-      const endP=head.clone().add(new V(Math.random()-0.5,Math.random()-0.5,Math.random()-0.5).multiplyScalar(hit?0.15:1.1));
-      spawnTracer(mz,endP,0xff4d4d); audioEnemyShot(mz);
-      if(hit){ state.hp-=8+Math.random()*7+state.wave*0.6; damageFlash=Math.min(1,damageFlash+0.6); screenBlood=Math.min(1,screenBlood+0.45); audioHurt(); if(state.hp<=0){ state.hp=0; gameOver(); } }
-    }
+    const canFire=e.los&&dist<26&&!state.over&&e.actor.muzzle&&e.reloadT<=0&&e.ammo>0;
+    if(e.burst>0){ e.burstT-=dt; if(e.burstT<=0){ if(canFire) enemyShot(e,head,dist,moving); e.burst--; e.burstT=0.11; } }
+    else if(e.fireCd<=0&&canFire){ e.fireCd=1.2+Math.random()*1.8; e.burst=1+((Math.random()*3)|0); e.burstT=0; }
+    if(e.ammo<=0&&e.reloadT<=0){ e.reloadT=2.4; e.burst=0; audioEnemyReload(p); }
   }
   for(const c of civs) c.actor.update(dt,{});
+  updatePrisoners(dt);
+}
+function enemyShot(e,head,dist,moving){
+  e.ammo--;
+  const mz=new V(); e.actor.muzzle.getWorldPosition(mz);
+  const hit=Math.random()<Math.max(0.12,(0.5-dist*0.012+state.wave*0.012-(moving?0.08:0)-(e.burst<2?0:0.06))*e.accMul);
+  const endP=head.clone().add(new V(Math.random()-0.5,Math.random()-0.5,Math.random()-0.5).multiplyScalar(hit?0.15:1.1));
+  spawnTracer(mz,endP,0xff4d4d); audioEnemyShot(mz);
+  if(hit){ state.hp-=8+Math.random()*7+state.wave*0.6; damageFlash=Math.min(1,damageFlash+0.6); screenBlood=Math.min(1,screenBlood+0.45); audioHurt(); if(state.hp<=0){ state.hp=0; gameOver(); } }
 }
 
 /* ============================== LOCOMOTION ============================== */
@@ -1477,7 +1660,7 @@ addEventListener('keydown',e=>{ keys[e.code]=true;
   if(e.code==='KeyE'&&state.started) desktopUse();
   if(e.code==='KeyF') startKick(); });
 addEventListener('keyup',e=>{ keys[e.code]=false; });
-function desktopUse(){ camera.getWorldPosition(_hp); let best=null, bd=1.8; for(const d of doors){ const dd=Math.hypot(_hp.x-d.center.x,_hp.z-d.center.z); if(dd<bd){ bd=dd; best=d; } } if(!best) return; if(best.open){ closeDoor(best); audioDoor(best.center); } else openDoor(best,_hp); }
+function desktopUse(){ camera.getWorldPosition(_hp); if(interactNear(_hp,1.7)) return; let best=null, bd=1.8; for(const d of doors){ const dd=Math.hypot(_hp.x-d.center.x,_hp.z-d.center.z); if(dd<bd){ bd=dd; best=d; } } if(!best) return; if(best.open){ closeDoor(best); audioDoor(best.center); } else openDoor(best,_hp); }
 renderer.domElement.addEventListener('mousedown',()=>{ if(renderer.xr.isPresenting||!state.started) return; if(!pointerLocked){ try{ renderer.domElement.requestPointerLock(); }catch(e){} return; }
   if(state.over){ resetGame(); return; } desktopShootHeld=true; fireOnce(null); });
 addEventListener('mouseup',()=>{ desktopShootHeld=false; });
@@ -1577,6 +1760,8 @@ function kickStrike(head,fwd){
       e.root.position.addScaledVector(fwd,0.35); collideXZ(e.root.position,0.22,0); audioKickHit(e.root.position);
       if(e.hp<=0) killEnemy(e,fwd.clone()); } }
 }
+const audioEnemyReload=A(p=>{ const t=audioCtx.currentTime, d=at(new V(p.x,1.1,p.z)); noise(t,0.04,2600,2,0.35,'bandpass',d); tone(t+0.02,'square',300,0,0.05,0.2,d); noise(t+1.5,0.05,1800,2,0.4,'bandpass',d); tone(t+1.55,'square',420,0,0.06,0.25,d); noise(t+2.05,0.06,3200,3,0.35,'bandpass',d); });
+const audioZip=A(p=>{ const t=audioCtx.currentTime, d=at(new V(p.x,1.0,p.z)); for(let i=0;i<9;i++) tone(t+i*0.025,'square',rr(2200,2800),0,0.012,0.08,d); });
 const audioKickSwing=A(()=>{ const t=audioCtx.currentTime; noise(t+0.12,0.18,600,0.7,0.25,'bandpass'); });
 const audioKickDoor=A(p=>{ const t=audioCtx.currentTime, d=at(p); noise(t,0.12,160,0.7,1.2,'lowpass',d); tone(t,'sine',70,35,0.2,0.9,d); noise(t+0.01,0.08,2200,1.2,0.6,'bandpass',d); noise(t+0.33,0.15,240,0.8,0.7,'lowpass',d); });
 const audioKickHit=A(p=>{ const t=audioCtx.currentTime, d=at(new V(p.x,1.1,p.z)); noise(t,0.1,300,0.8,0.9,'lowpass',d); tone(t,'sine',110,50,0.12,0.6,d); });
@@ -1640,7 +1825,7 @@ enterVRBtn.addEventListener('click',async()=>{
   }catch(err){ xrStatus.textContent='Could not start VR: '+(err&&err.message?err.message:err); }
 });
 desktopBtn.addEventListener('click',()=>{ if(!audioCtx) initAudio(); overlay.style.display='none'; desktopChrome(true); beginGame(); try{ renderer.domElement.requestPointerLock(); }catch(e){} });
-window.__bp={T,state,enemies,civs,corpses,doors,colliders,findPath,navBlocked,NAV_N,dolly,scene,renderer,camera,step,throwFlash,killEnemy,hitCiv,WEAPONS,MODELS,ROOMS,swapWeapon,decalIM,poolIM,spawnCiv,spawnEnemy,fireOnce,startKick,kick,legRoot,kickDoor,getKick:()=>KICK_CLIP}; // debug handle for testing
+window.__bp={T,state,enemies,civs,corpses,doors,colliders,findPath,navBlocked,NAV_N,dolly,scene,renderer,camera,step,throwFlash,killEnemy,hitCiv,WEAPONS,MODELS,ROOMS,swapWeapon,decalIM,poolIM,spawnCiv,spawnEnemy,fireOnce,startKick,kick,legRoot,kickDoor,getKick:()=>KICK_CLIP,prisoners,maybeSurrender,interactNear,damageEnemy}; // debug handle for testing
 </script>
 
 </body>
