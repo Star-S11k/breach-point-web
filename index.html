@@ -721,6 +721,27 @@ function buildWeaponGroup(w,proc){
 buildWeaponGroup(WEAPONS.rifle,PROC_RIFLE); buildWeaponGroup(WEAPONS.pistol,PROC_PISTOL);
 let gun=null;   // currently held weapon group
 // SCAR-17 from Sketchfab: un-rotate the model's tilted root, recolour to coyote, scale to a real 1 m rifle
+let ENEMY_RIFLE=null;
+function enemyRifle(mount){   // real SCAR when loaded, else the procedural rifle; returns the muzzle object and support-hand point
+  const muzzle=new T.Object3D();
+  if(ENEMY_RIFLE){ mount.add(ENEMY_RIFLE.obj.clone()); muzzle.position.copy(ENEMY_RIFLE.muzzle); mount.add(muzzle); return {muzzle,gripL:ENEMY_RIFLE.gripL,gripR:ENEMY_RIFLE.gripR}; }
+  mount.add(procMesh(PROC_RIFLE)); muzzle.position.copy(RIFLE_MUZZLE); mount.add(muzzle); return {muzzle,gripL:RIFLE_GRIP_L,gripR:RIFLE_GRIP_R};
+}
+// hand bones: point the fingers along dir, then roll about that axis so the palm faces palmWant (palmLocal = palm normal in bone space)
+function orientHand(hand,mid,dir,palmLocal,palmWant){
+  aimBone(hand,mid,hand.getWorldPosition(new V()).addScaledVector(dir,0.1));
+  const ax=dir.clone().normalize(), pn=palmLocal.clone().applyQuaternion(hand.getWorldQuaternion(new T.Quaternion()));
+  pn.addScaledVector(ax,-pn.dot(ax)); const pw=palmWant.clone().addScaledVector(ax,-palmWant.dot(ax));
+  if(pn.lengthSq()<1e-6||pw.lengthSq()<1e-6) return;
+  rotWorld(hand,ax,Math.atan2(ax.dot(pn.clone().cross(pw)),pn.dot(pw)));
+}
+// Mixamo finger curl: every finger joint bends about its local +X (T-pose, palms down). amt per hand, trigger finger separate.
+const FINGERS=['Index','Middle','Ring','Pinky'], _cq=new T.Quaternion(), _cx=new V(1,0,0);
+function fingerRig(inner,side){ const out=[]; for(const f of [...FINGERS,'Thumb']) for(let j=1;j<=3;j++){ const b=inner.getObjectByName('mixamorig'+side+'Hand'+f+j); if(b) out.push({b,f,j}); } return out; }
+function curlFingers(list,amt,trigger){
+  for(const {b,f,j} of list){ const k=f==='Thumb'?0.35*(j===1?0.6:1):(f==='Index'&&trigger!==undefined?trigger:1)*(j===1?0.9:j===2?1.1:0.8);
+    b.quaternion.multiply(_cq.setFromAxisAngle(_cx,amt*k)); }
+}
 function installScar(gltf){
   const s=gltf.scene, node=s.getObjectByName('fn_scar_17');
   if(node) node.quaternion.set(0.02795,-0.03264,0,0.99908).normalize();
@@ -733,6 +754,8 @@ function installScar(gltf){
     old.dispose(); o.castShadow=true; o.frustumCulled=false; });
   const SC=0.09; s.scale.setScalar(SC); s.position.set(-0.016,0.131,-0.177);   // grip centre measured from the mesh
   const w=WEAPONS.rifle, h=w.group.userData.holder; h.clear(); h.add(s);
+  // operators carry the same rifle. Wrist targets: right wrist behind/above the palm on the grip, left wrist under the handguard
+  ENEMY_RIFLE={obj:s,muzzle:new V(-0.024,0.176,-0.875),gripR:new V(0.012,0.03,0.065),gripL:new V(-0.03,0.065,-0.27)};
   w.muzzle.set(-0.024,0.176,-0.875); w.guard.set(-0.009,0.057,-0.361); w.magPt.set(0.004,-0.019,-0.191); w.eject.set(0.04,0.12,-0.15); w.suppressed=true;
   w.muzzleObj.position.copy(w.muzzle); w.flash.position.copy(w.muzzle); w.flash.scale.setScalar(0.5);
   w.view.set(0.2,-0.24,-0.44);
@@ -1055,15 +1078,40 @@ function soldierActor(){
   const mixer=new T.AnimationMixer(inner), acts={}; for(const c of g.animations) acts[c.name]=mixer.clipAction(c);
   acts.Idle.play();
   if(KICK_CLIP){ const kc=mixer.clipAction(KICK_CLIP); kc.setLoop(T.LoopOnce,1); kc.clampWhenFinished=true; acts.Kick=kc; }
-  const mount=new T.Group(); mount.rotation.y=Math.PI; root.add(mount); mount.add(procMesh(PROC_RIFLE));
-  const muzzle=new T.Object3D(); muzzle.position.copy(RIFLE_MUZZLE); mount.add(muzzle);
-  const a={kind:'soldier',root,hits,mats,muzzle,mixer,acts,cur:'Idle',B,mount,aimK:0,flinch:0};
+  const mount=new T.Group(); mount.rotation.y=Math.PI; root.add(mount);
+  const {muzzle,gripL}=enemyRifle(mount);
+  const a={kind:'soldier',root,hits,mats,muzzle,gripL,mixer,acts,cur:'Idle',B,mount,aimK:0,flinch:0};
+  a.update=(dt,st)=>soldierPose(a,dt,st);
+  a.dispose=()=>{ scene.remove(root); mixer.stopAllAction(); mats.forEach(m=>m.dispose()); };
+  return a;
+}
+// Real operator (Mixamo character, converted FBX -> GLB, Y-up, faces +Z). Walk/Run are the soldier's clips retargeted,
+// Idle is a breathing clip built from its own bind pose, Kick is the Mixamo door kick.
+function mixamoEnemyActor(){
+  const g=MODELS.enemy, inner=skelClone(g.scene);
+  const root=new T.Group(); root.rotation.order='YXZ'; root.add(inner);
+  const mats=[];
+  inner.traverse(o=>{ if(o.isMesh){ o.material=o.material.clone(); mats.push(o.material); o.castShadow=true; o.receiveShadow=true; o.frustumCulled=false; } });
+  const B=rigBones(inner); root.updateMatrixWorld(true);
+  const hits=rigHitboxes(B);
+  const rest=new Map(); inner.traverse(o=>{ if(o.isBone) rest.set(o,{q:o.quaternion.clone(),p:o.position.clone()}); });
+  const mixer=new T.AnimationMixer(inner), acts={};
+  for(const n in ENEMY_CLIPS) acts[n]=mixer.clipAction(ENEMY_CLIPS[n]);
+  if(acts.Kick){ acts.Kick.setLoop(T.LoopOnce,1); acts.Kick.clampWhenFinished=true; }
+  acts.Idle.time=Math.random()*4; acts.Idle.play();
+  const mount=new T.Group(); mount.rotation.y=Math.PI; root.add(mount);
+  const {muzzle,gripL,gripR}=enemyRifle(mount);
+  // bind pose is a T-pose with the palms down: store each palm normal in its hand bone's space
+  const palm=h=>new V(0,-1,0).applyQuaternion(h.getWorldQuaternion(new T.Quaternion()).invert());
+  const a={kind:'soldier',root,hits,mats,muzzle,gripL,gripR,mixer,acts,cur:'Idle',B,mount,aimK:0,flinch:0,rest,shoulderMount:true,
+    palmL:palm(B.lHand),palmR:palm(B.rHand),fingL:fingerRig(inner,'Left'),fingR:fingerRig(inner,'Right')};
   a.update=(dt,st)=>soldierPose(a,dt,st);
   a.dispose=()=>{ scene.remove(root); mixer.stopAllAction(); mats.forEach(m=>m.dispose()); };
   return a;
 }
 const _rq=new T.Quaternion(), _rx=new V(), _fw=new V();
 function soldierPose(a,dt,st){
+  if(a.rest) restoreRest(a);   // procedural IK edits must not pile up on bones the current clip does not drive
   let want=(st.stun||st.surrender)?'Idle':(st.moving?(st.speed>1.35?'Run':'Walk'):'Idle');
   if(st.kick&&a.acts.Kick) want='Kick';
   if(want!==a.cur){ const to=a.acts[want]; to.reset(); if(want==='Kick') to.time=KICK_START; to.play();   // start after the clip's turn-in: bots already face the door
@@ -1085,16 +1133,27 @@ function soldierPose(a,dt,st){
   const rl=st.reload||0;   // 0..1 reload progress: rifle canted, support hand to the mag, to the vest, back
   if(st.stun){ a.mount.position.set(-0.2,0.95-drop,0.12); a.mount.rotation.set(1.25,Math.PI,0); }
   else { const cant=rl>0?Math.sin(Math.min(1,rl*1.2)*Math.PI)*0.55:0;
-    a.mount.position.set(lerp(-0.14,-0.1,k),lerp(1.2,1.39,k)-drop-cant*0.08,lerp(0.2,0.27,k)); a.mount.rotation.set(lerp(0.6,0.0,k)+cant*0.5,Math.PI,cant); }
+    if(a.shoulderMount){   // stock in the right shoulder pocket (measured on this body), so any proportions hold it right
+      const sh=a.root.worldToLocal(B.rArm.getWorldPosition(new V()));
+      a.mount.position.set(sh.x+lerp(0.09,0.085,k),sh.y+lerp(-0.24,-0.02,k)-cant*0.08,sh.z+lerp(0.17,0.2,k));
+      if(a.cur!=='Kick') rotWorld(B.neck,_rx,0.12*k); }   // cheek down onto the stock
+    else a.mount.position.set(lerp(-0.14,-0.1,k),lerp(1.2,1.39,k)-drop-cant*0.08,lerp(0.2,0.27,k));
+    a.mount.rotation.set(lerp(0.6,0.0,k)+cant*0.5,Math.PI,cant); }
   a.mount.updateMatrixWorld(true);
   let R,L;
   if(st.stun){ const hd=B.head.getWorldPosition(new V()).addScaledVector(_fw,0.13); R=hd.clone().addScaledVector(_rx,-0.06); L=hd.clone().addScaledVector(_rx,0.06); }
-  else { R=a.mount.localToWorld(RIFLE_GRIP_R.clone()); L=a.mount.localToWorld(RIFLE_GRIP_L.clone());
+  else { R=a.mount.localToWorld((a.gripR||RIFLE_GRIP_R).clone()); L=a.mount.localToWorld((a.gripL||RIFLE_GRIP_L).clone());
     if(rl>0){ const well=a.mount.localToWorld(new V(0,-0.1,-0.09)), pouch=a.root.localToWorld(new V(0.06,1.12-drop,0.2));
       L = rl<0.25 ? L.lerp(well,rl/0.25) : rl<0.5 ? well.lerp(pouch,(rl-0.25)/0.25) : rl<0.75 ? pouch.lerp(well,(rl-0.5)/0.25) : well.lerp(L,(rl-0.75)/0.25); } }
   const poleR=new V(-0.7,-1,-0.15).applyQuaternion(_rq), poleL=new V(0.5,-1,0.1).applyQuaternion(_rq);
   twoBoneIK(B.rArm,B.rFore,B.rHand,R,poleR); twoBoneIK(B.lArm,B.lFore,B.lHand,L,poleL);
-  const gf=new V(0,0,-1).applyQuaternion(a.mount.getWorldQuaternion(new T.Quaternion()));
+  const mq=a.mount.getWorldQuaternion(new T.Quaternion()), gf=new V(0,0,-1).applyQuaternion(mq);
+  if(a.palmR&&!st.stun){   // real hands: palm round the pistol grip (index on the trigger), support hand cupping the handguard
+    orientHand(B.rHand,B.rMid,new V(0,-0.55,-0.85).applyQuaternion(mq),a.palmR,new V(-1,0,0).applyQuaternion(mq));
+    curlFingers(a.fingR,1.15,0.35);
+    if(!(rl>0)){ orientHand(B.lHand,B.lMid,new V(0.25,0.3,-0.9).applyQuaternion(mq),a.palmL,new V(0.45,0.9,0).applyQuaternion(mq)); curlFingers(a.fingL,1.0); }
+    else curlFingers(a.fingL,0.6);
+    return; }
   if(B.rMid) aimBone(B.rHand,B.rMid,B.rHand.getWorldPosition(new V()).addScaledVector(st.stun?UP:gf,0.1));
   if(B.lMid) aimBone(B.lHand,B.lMid,B.lHand.getWorldPosition(new V()).addScaledVector(st.stun?UP:gf,0.1));
 }
@@ -1169,7 +1228,38 @@ const loadState={soldier:'…',civ:'…',scar:'…',glock:'…',kick:'…',fear:
 function showLoad(){ const ok=Object.values(loadState).every(v=>v!=='…');
   loadStatusEl.textContent=ok?`Operators: ${loadState.soldier} · Hostages: ${loadState.civ} · SCAR: ${loadState.scar} · Glock: ${loadState.glock} · Door kick: ${loadState.kick} · Fear: ${loadState.fear}`:'Loading operators and weapons… '+Object.entries(loadState).map(([k,v])=>k+' '+v).join(' · '); }
 showLoad();
-loadFirst(MODEL_BASES.map(b=>b+'Soldier.glb')).then(g=>{ if(g){ MODELS.soldier=g; loadState.soldier='real'; } else loadState.soldier='simple'; showLoad(); });
+loadFirst(MODEL_BASES.map(b=>b+'Soldier.glb')).then(g=>{ if(g){ MODELS.soldier=g; if(loadState.soldier==='…') loadState.soldier='armoured'; } else if(loadState.soldier==='…') loadState.soldier='simple'; buildEnemyClips(); showLoad(); });
+loadFirst(['models/enemy1.glb']).then(g=>{ if(g){ g.scene.traverse(o=>{ if(o.isMesh){ o.material.envMapIntensity=0.6; } }); MODELS.enemy=g; } buildEnemyClips(); showLoad(); });
+// soldier clips (Z-up armature, facing -Z) -> Y-up Mixamo rig facing +Z: hips rotated by Ry(180)*Rx(-90), hips pinned in place
+// and re-heighted to the target's own hips. Other bones are local rotations and carry over between Mixamo rigs.
+let ENEMY_CLIPS=null;
+function buildEnemyClips(){
+  if(!MODELS.enemy||!MODELS.soldier) return;
+  const dstHips=MODELS.enemy.scene.getObjectByName('mixamorigHips'), dst=dstHips.position.clone(), srcH=MODELS.soldier.scene.getObjectByName('mixamorigHips').position.z;
+  // the two rigs have different bone rolls (legs differ by 180 deg about their own axis, shoulders by 90), so local rotations
+  // cannot be copied. Per bone, C = inverse(srcBindWorld) * dstBindWorld maps frames; dstLocal(t) = inverse(C_parent) * srcLocal(t) * C_bone.
+  const S=MODELS.soldier.scene, E=MODELS.enemy.scene; S.updateMatrixWorld(true); E.updateMatrixWorld(true);
+  const pre=new T.Quaternion().setFromAxisAngle(new V(0,1,0),Math.PI);   // soldier faces -Z, operator +Z
+  const wq=o=>o.getWorldQuaternion(new T.Quaternion()), Cof=(s,d)=>pre.clone().multiply(wq(s)).invert().multiply(wq(d)), q=new T.Quaternion();
+  const conv=name=>{ const c=MODELS.soldier.animations.find(x=>x.name===name).clone(); c.name=name; const keep=[];
+    for(const tr of c.tracks){
+      const dot=tr.name.lastIndexOf('.'), bn=tr.name.slice(0,dot), prop=tr.name.slice(dot+1), sb=S.getObjectByName(bn), db=E.getObjectByName(bn);
+      if(!sb||!db||!sb.parent||!db.parent) continue;
+      if(prop==='quaternion'){ const Cb=Cof(sb,db), Cpi=Cof(sb.parent,db.parent).invert(), v=tr.values;
+        for(let i=0;i<v.length;i+=4) q.fromArray(v,i).premultiply(Cpi).multiply(Cb).toArray(v,i); keep.push(tr); }
+      else if(prop==='position'&&bn==='mixamorigHips'){ const v=tr.values; for(let i=0;i<v.length;i+=3){ const z=v[i+2]; v[i]=dst.x; v[i+1]=dst.y+(z-srcH); v[i+2]=dst.z; } keep.push(tr); } }
+    c.tracks=keep; return c; };
+  // idle: own bind pose (legs straight, natural) with slow breathing in the chest
+  const sp2=MODELS.enemy.scene.getObjectByName('mixamorigSpine2'), sp=MODELS.enemy.scene.getObjectByName('mixamorigSpine');
+  const breath=(bone,amp)=>{ const times=[0,1.6,3.2], vals=[]; for(const s of [0,1,0]){ const qq=bone.quaternion.clone().multiply(new T.Quaternion().setFromAxisAngle(new V(1,0,0),-amp*s)); vals.push(qq.x,qq.y,qq.z,qq.w); }
+    return new T.QuaternionKeyframeTrack(bone.name+'.quaternion',times,vals); };
+  ENEMY_CLIPS={Idle:new T.AnimationClip('Idle',3.2,[breath(sp2,0.035),breath(sp,0.015)]),Walk:conv('Walk'),Run:conv('Run')};
+  if(KICK_RAW){ const c=KICK_RAW.clone(); c.name='Kick';
+    for(const tr of c.tracks){ tr.name=tr.name.replace(/^mixamorig\d*/,'mixamorig');
+      if(tr.name==='mixamorigHips.position'){ const v=tr.values, y0=v[1]; for(let i=0;i<v.length;i+=3){ const y=v[i+1]; v[i]=dst.x; v[i+1]=dst.y+(y-y0); v[i+2]=dst.z; } } }
+    ENEMY_CLIPS.Kick=c; }
+  loadState.soldier='real';
+}
 // hostage: Mixamo "Leonard" (converted FBX -> GLB, textures 1024). Hair/lashes are cut-outs, not blended, to avoid sorting artefacts.
 loadFirst(['models/hostage.glb']).then(g=>{ if(g){
     g.scene.traverse(o=>{ if(o.isMesh){ const m=o.material; if(m.transparent){ m.transparent=false; m.alphaTest=0.5; } m.envMapIntensity=0.5; m.roughness=0.75; } });
@@ -1193,7 +1283,8 @@ function fixKickClip(clip){
   }
   return clip;
 }
-new FBXLoader().loadAsync('models/kick.fbx').then(f=>{ KICK_CLIP=fixKickClip(f.animations[0]); loadState.kick='yes'; showLoad(); }).catch(()=>{ loadState.kick='no'; showLoad(); });
+let KICK_RAW=null;
+new FBXLoader().loadAsync('models/kick.fbx').then(f=>{ KICK_RAW=f.animations[0].clone(); KICK_CLIP=fixKickClip(f.animations[0]); loadState.kick='yes'; buildEnemyClips(); showLoad(); }).catch(()=>{ loadState.kick='no'; showLoad(); });
 
 /* ============================== RAGDOLL (Verlet) ============================== */
 // 18 joint particles linked by bone-length and torso-bracing constraints. Gravity, the bullet's push, floor friction,
@@ -1286,7 +1377,7 @@ function reachableSpot(out){
   return path;
 }
 function spawnEnemy(){
-  const actor=MODELS.soldier?soldierActor():boxActor('soldier');
+  const actor=(MODELS.enemy&&ENEMY_CLIPS)?mixamoEnemyActor():MODELS.soldier?soldierActor():boxActor('soldier');
   const path=reachableSpot(actor.root.position); scene.add(actor.root);
   const flank=Math.random()<0.5;
   const e={actor,root:actor.root,hp:100,alive:true,flash:0,losT:0,los:false,lastHead:false,stunT:0,noPath:0,stepAcc:0,
@@ -1881,7 +1972,7 @@ enterVRBtn.addEventListener('click',async()=>{
   }catch(err){ xrStatus.textContent='Could not start VR: '+(err&&err.message?err.message:err); }
 });
 desktopBtn.addEventListener('click',()=>{ if(!audioCtx) initAudio(); overlay.style.display='none'; desktopChrome(true); beginGame(); try{ renderer.domElement.requestPointerLock(); }catch(e){} });
-window.__bp={T,state,enemies,civs,corpses,doors,colliders,findPath,navBlocked,NAV_N,dolly,scene,renderer,camera,step,throwFlash,killEnemy,hitCiv,WEAPONS,MODELS,ROOMS,swapWeapon,decalIM,poolIM,spawnCiv,spawnEnemy,fireOnce,startKick,kick,legRoot,kickDoor,getKick:()=>KICK_CLIP,prisoners,maybeSurrender,interactNear,damageEnemy,scareNear,getFear:()=>TERRIFIED_CLIP}; // debug handle for testing
+window.__bp={T,state,enemies,civs,corpses,doors,colliders,findPath,navBlocked,NAV_N,dolly,scene,renderer,camera,step,throwFlash,killEnemy,hitCiv,WEAPONS,MODELS,ROOMS,swapWeapon,decalIM,poolIM,spawnCiv,spawnEnemy,fireOnce,startKick,kick,legRoot,kickDoor,getKick:()=>KICK_CLIP,prisoners,maybeSurrender,interactNear,damageEnemy,scareNear,getFear:()=>TERRIFIED_CLIP,getEnemyClips:()=>ENEMY_CLIPS}; // debug handle for testing
 </script>
 
 </body>
