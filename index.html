@@ -1028,8 +1028,11 @@ function handsUpPose(a,kneel,onHead,tr,opts){
     rotWorld(B.neck,UP,-T.MathUtils.clamp(yaw,-0.9,0.9)*(kneel?0.5:0.75));
   }
   let L,Rr,pL,pR;
-  if(onHead){ const top=B.headTop.getWorldPosition(new V()), press=0.02*s;
-    L=top.clone().addScaledVector(_rx,0.075+tr2).addScaledVector(_fw,-0.04).add(new V(0,-0.05-press+tr,0)); Rr=top.clone().addScaledVector(_rx,-0.075+tr2).addScaledVector(_fw,-0.04).add(new V(0,-0.05-press-tr,0));
+  if(onHead){ // palms on the back of the head: measured from the skull centre so the hands sit on it, never inside it
+    const top=B.headTop.getWorldPosition(new V()), hc=B.head.getWorldPosition(new V()).lerp(top,0.55), press=0.015*s;
+    const dir=side=>new V(0,0.7,0).addScaledVector(_fw,-0.55).addScaledVector(_rx,0.45*side).normalize();
+    L=hc.clone().addScaledVector(dir(1),0.13-press).addScaledVector(_rx,tr2).add(new V(0,tr,0));
+    Rr=hc.clone().addScaledVector(dir(-1),0.13-press).addScaledVector(_rx,tr2).add(new V(0,-tr,0));
     pL=_rx.clone().addScaledVector(_fw,0.4); pR=_rx.clone().negate().addScaledVector(_fw,0.4); }
   else { const up=0.43+0.06*s, out=0.05+0.07*s, fw=0.06+0.1*s;
     L=B.lArm.getWorldPosition(new V()).add(new V(0,up+tr,0)).addScaledVector(_rx,out+tr2).addScaledVector(_fw,fw);
