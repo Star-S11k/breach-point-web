@@ -77,7 +77,7 @@
   <div class="stat"><span>Flash</span><b id="m-fb">2</b></div>
   <div class="stat ammo"><span id="m-wpn">SCAR-17</span><b id="m-ammo">20</b></div>
 </div>
-<div id="hint">WASD move · mouse look · click fire · R reload · Q weapon · G flashbang · E door · Esc cursor</div>
+<div id="hint">WASD move · mouse look · click fire · R reload · Q weapon · F kick · G flashbang · E door · Esc cursor</div>
 
 <div id="overlay">
   <div class="card">
@@ -92,6 +92,7 @@
       <div class="ctl"><b>Right stick click · grip at hip</b><span>Swap SCAR / Glock</span></div>
       <div class="ctl"><b>B / Y</b><span>Throw flashbang (2 per wave)</span></div>
       <div class="ctl"><b>Left stick · right stick</b><span>Move · snap turn. Push doors with your hand</span></div>
+      <div class="ctl"><b>Left stick click</b><span>Front kick: smash a door open, stagger an enemy</span></div>
     </div>
     <div class="btns">
       <button class="go" id="enterVR" disabled>Enter VR</button>
@@ -110,6 +111,7 @@ import * as T from 'three';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { clone as skelClone } from 'three/addons/utils/SkeletonUtils.js';
 import { mergeBufferGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
+import { FBXLoader } from 'three/addons/loaders/FBXLoader.js';
 const V=T.Vector3, UP=new V(0,1,0), ZAX=new V(0,0,1);
 const lerp=(a,b,t)=>a+(b-a)*t;
 
@@ -637,11 +639,13 @@ function collideXZ(p,r,y){
   }
 }
 const _hp=new V(), _pp=new V(), _t=new V();
+let floorY=0, kickLift=0;   // dolly height = walkable floor + a small head rise while kicking
 function playerPhysics(dt){
-  camera.getWorldPosition(_hp); _pp.set(_hp.x,dolly.position.y,_hp.z);
-  const bx=_pp.x, bz=_pp.z; collideXZ(_pp,0.25,dolly.position.y);
+  camera.getWorldPosition(_hp); _pp.set(_hp.x,floorY,_hp.z);
+  const bx=_pp.x, bz=_pp.z; collideXZ(_pp,0.25,floorY);
   dolly.position.x+=_pp.x-bx; dolly.position.z+=_pp.z-bz;
-  const target=floorAt(_pp.x,_pp.z,dolly.position.y); dolly.position.y+=(target-dolly.position.y)*Math.min(1,dt*12);
+  const target=floorAt(_pp.x,_pp.z,floorY); floorY+=(target-floorY)*Math.min(1,dt*12);
+  dolly.position.y=floorY+kickLift;
 }
 
 /* ============================== WEAPON GEOMETRY ============================== */
@@ -815,7 +819,7 @@ function pollButtons(){
     const ax=!!(b[4]&&b[4].pressed), by=!!(b[5]&&b[5].pressed), st=!!(b[3]&&b[3].pressed);
     if(ax&&!prev[4]) reload();
     if(by&&!prev[5]){ const hand=(c===gunCtrl)?(offCtrl()||c):c, p=new V(), q=new T.Quaternion(); hand.getWorldPosition(p); hand.getWorldQuaternion(q); if(throwFlash(p,new V(0,0,-1).applyQuaternion(q))) pulse(hand,0.4,40); }
-    if(st&&!prev[3]&&c===gunCtrl) swapWeapon();
+    if(st&&!prev[3]){ if(c===gunCtrl) swapWeapon(); else startKick(); }   // right stick click: swap · left stick click: kick
     prev[4]=ax; prev[5]=by; prev[3]=st;
   }
 }
@@ -996,6 +1000,7 @@ function soldierActor(){
   const hits=rigHitboxes(B);
   const mixer=new T.AnimationMixer(inner), acts={}; for(const c of g.animations) acts[c.name]=mixer.clipAction(c);
   acts.Idle.play();
+  if(KICK_CLIP){ const kc=mixer.clipAction(KICK_CLIP); kc.setLoop(T.LoopOnce,1); kc.clampWhenFinished=true; acts.Kick=kc; }
   const mount=new T.Group(); mount.rotation.y=Math.PI; root.add(mount); mount.add(procMesh(PROC_RIFLE));
   const muzzle=new T.Object3D(); muzzle.position.copy(RIFLE_MUZZLE); mount.add(muzzle);
   const a={kind:'soldier',root,hits,mats,muzzle,mixer,acts,cur:'Idle',B,mount,aimK:0,flinch:0};
@@ -1005,8 +1010,10 @@ function soldierActor(){
 }
 const _rq=new T.Quaternion(), _rx=new V(), _fw=new V();
 function soldierPose(a,dt,st){
-  const want=st.stun?'Idle':(st.moving?(st.speed>1.35?'Run':'Walk'):'Idle');
-  if(want!==a.cur){ const to=a.acts[want]; to.reset().play(); a.acts[a.cur].crossFadeTo(to,0.22,false); a.cur=want; }
+  let want=st.stun?'Idle':(st.moving?(st.speed>1.35?'Run':'Walk'):'Idle');
+  if(st.kick&&a.acts.Kick) want='Kick';
+  if(want!==a.cur){ const to=a.acts[want]; to.reset(); if(want==='Kick') to.time=KICK_START; to.play();   // start after the clip's turn-in: bots already face the door
+    a.acts[a.cur].crossFadeTo(to,(want==='Kick'||a.cur==='Kick')?0.15:0.22,false); a.cur=want; }
   if(a.acts.Walk) a.acts.Walk.timeScale=Math.max(0.6,st.speed/1.25);
   if(a.acts.Run) a.acts.Run.timeScale=Math.max(0.8,st.speed/3.2);
   a.mixer.update(dt);
@@ -1015,7 +1022,7 @@ function soldierPose(a,dt,st){
   a.root.getWorldQuaternion(_rq); _rx.set(1,0,0).applyQuaternion(_rq); _fw.set(0,0,1).applyQuaternion(_rq);
   const B=a.B;
   // bladed stance: shoulders turned so the support hand reaches the handguard; head stays on target
-  rotWorld(B.spine2,UP,-(0.18+0.32*k)); rotWorld(B.neck,UP,0.18+0.32*k);
+  if(a.cur!=='Kick'){ rotWorld(B.spine2,UP,-(0.18+0.32*k)); rotWorld(B.neck,UP,0.18+0.32*k); }
   if(a.flinch>0){ a.flinch=Math.max(0,a.flinch-dt*6); rotWorld(B.spine1,_rx,-0.3*a.flinch); }
   if(st.stun){ a.mount.position.set(-0.2,0.95,0.12); a.mount.rotation.x=1.25; }
   else { a.mount.position.set(lerp(-0.14,-0.1,k),lerp(1.2,1.39,k),lerp(0.2,0.27,k)); a.mount.rotation.x=lerp(0.6,0.0,k); }
@@ -1069,9 +1076,9 @@ function boxActor(kind){
   return a;
 }
 const loadStatusEl=document.getElementById('loadstatus');
-const loadState={soldier:'…',civ:'…',scar:'…',glock:'…'};
+const loadState={soldier:'…',civ:'…',scar:'…',glock:'…',kick:'…'};
 function showLoad(){ const ok=Object.values(loadState).every(v=>v!=='…');
-  loadStatusEl.textContent=ok?`Operators: ${loadState.soldier} · Hostages: ${loadState.civ} · SCAR: ${loadState.scar} · Glock: ${loadState.glock}`:'Loading operators and weapons… '+Object.entries(loadState).map(([k,v])=>k+' '+v).join(' · '); }
+  loadStatusEl.textContent=ok?`Operators: ${loadState.soldier} · Hostages: ${loadState.civ} · SCAR: ${loadState.scar} · Glock: ${loadState.glock} · Door kick: ${loadState.kick}`:'Loading operators and weapons… '+Object.entries(loadState).map(([k,v])=>k+' '+v).join(' · '); }
 showLoad();
 loadFirst(MODEL_BASES.map(b=>b+'Soldier.glb')).then(g=>{ if(g){ MODELS.soldier=g; loadState.soldier='real'; } else loadState.soldier='simple'; showLoad(); });
 loadFirst(MODEL_BASES.map(b=>b+'Michelle.glb')).then(g=>{ if(g){
@@ -1079,6 +1086,18 @@ loadFirst(MODEL_BASES.map(b=>b+'Michelle.glb')).then(g=>{ if(g){
     MODELS.civ=g; loadState.civ='real'; } else loadState.civ='simple'; showLoad(); });
 loadFirst(['models/scar17.glb']).then(g=>{ if(g){ installScar(g); loadState.scar='model'; } else loadState.scar='simple'; showLoad(); });
 loadFirst(['models/glock17.glb']).then(g=>{ if(g){ installGlock(g); loadState.glock='model'; } else loadState.glock='simple'; showLoad(); });
+// Mixamo "Rifle Turn And Kick": the FBX hips track is Y-up while the soldier's armature is Z-up (rotated -90 deg about X).
+// Convert the hips position/rotation into that space and drop the horizontal root drift so the kick plays in place.
+let KICK_CLIP=null; const KICK_START=0.95, KICK_HIT=1.38, KICK_END=2.1;   // seconds in the clip: after the turn, foot contact, back to stance
+function fixKickClip(clip){
+  const rq=new T.Quaternion().setFromAxisAngle(new V(1,0,0),Math.PI/2), q=new T.Quaternion();
+  for(const tr of clip.tracks){
+    if(tr.name==='mixamorigHips.position'){ const v=tr.values; for(let i=0;i<v.length;i+=3){ const y=v[i+1]; v[i]=0; v[i+1]=0; v[i+2]=y; } }
+    if(tr.name==='mixamorigHips.quaternion'){ const v=tr.values; for(let i=0;i<v.length;i+=4) q.fromArray(v,i).premultiply(rq).toArray(v,i); }
+  }
+  return clip;
+}
+new FBXLoader().loadAsync('models/kick.fbx').then(f=>{ KICK_CLIP=fixKickClip(f.animations[0]); loadState.kick='yes'; showLoad(); }).catch(()=>{ loadState.kick='no'; showLoad(); });
 
 /* ============================== OPPOSING TEAM + HOSTAGES ============================== */
 const enemies=[], enemyMeshes=[], civs=[], corpses=[];
@@ -1152,7 +1171,7 @@ function resetGame(){
   corpses.forEach(c=>{ c.actor.dispose(); if(c.droppedGun) scene.remove(c.droppedGun); }); corpses.length=0;
   grenades.slice().forEach(g=>scene.remove(g.mesh)); grenades.length=0; clearBlood();
   Object.assign(state,{hp:100,ammo:{rifle:WEAPONS.rifle.mag,pistol:WEAPONS.pistol.mag},reloading:false,score:0,wave:0,kills:0,waveActive:false,over:false,pending:0,nextWaveT:0,flashbangs:FB_MAX});
-  whiteout=0; screenBlood=0; dolly.position.copy(SPAWN); dolly.rotation.set(0,0,0); yaw=0; pitch=0;
+  whiteout=0; screenBlood=0; dolly.position.copy(SPAWN); dolly.rotation.set(0,0,0); yaw=0; pitch=0; floorY=0; kickLift=0; kick.t=-1;
   holdWeapon('rifle'); closeDoors(true); startWave();
 }
 function startWave(){
@@ -1173,8 +1192,10 @@ function checkWaveEnd(){
 function gameOver(){ state.over=true; state.waveActive=false; state.pending=0; showBanner("YOU'RE HIT, OUT",'Score '+state.score+' · Wave '+state.wave+' · TRIGGER to restart','#e2432f',999); }
 
 /* ============================== DOORS ============================== */
-function openDoor(d,from){ if(d.open) return; const s=_t.subVectors(from,d.center).dot(d.normal)>=0?1:-1; d.target=s>0?1.75:-1.75; d.open=true; d.box.off=true; audioDoor(d.center); }
-function closeDoor(d){ if(!d.open) return; d.open=false; d.target=0; d.box.off=false; }
+function openDoor(d,from,quiet){ if(d.open) return; const s=_t.subVectors(from,d.center).dot(d.normal)>=0?1:-1; d.target=s>0?1.75:-1.75; d.open=true; d.box.off=true; d.speed=7; if(!quiet) audioDoor(d.center); }
+// kicked in: the leaf slams open three times faster, with splinters off the latch side and a heavy bang
+function kickDoor(d,from){ if(d.open) return; openDoor(d,from,true); d.speed=20; audioKickDoor(d.center); spawnImpact(new V(d.center.x,1.0,d.center.z).addScaledVector(d.along,0.4),0xc9a46a,10); }
+function closeDoor(d){ if(!d.open) return; d.open=false; d.target=0; d.box.off=false; d.speed=7; }
 function doorClear(d){ camera.getWorldPosition(_hp); if(Math.hypot(_hp.x-d.center.x,_hp.z-d.center.z)<1.3) return false;
   for(const e of enemies) if(Math.hypot(e.root.position.x-d.center.x,e.root.position.z-d.center.z)<1.3) return false; return true; }
 function closeDoors(force){ for(const d of doors) if(d.open&&(force||doorClear(d))) closeDoor(d); }
@@ -1193,7 +1214,7 @@ function updateDoors(dt){
     }
   }
   let moved=false;
-  for(const d of doors){ const na=d.angle+(d.target-d.angle)*Math.min(1,dt*7); if(Math.abs(na-d.angle)>1e-4||d.dirty){ d.angle=na; d.dirty=false; writeDoor(d); moved=true; } }
+  for(const d of doors){ const na=d.angle+(d.target-d.angle)*Math.min(1,dt*(d.speed||7)); if(Math.abs(na-d.angle)>1e-4||d.dirty){ d.angle=na; d.dirty=false; writeDoor(d); moved=true; } }
   if(moved){ doorLeafIM.instanceMatrix.needsUpdate=true; doorKnobIM.instanceMatrix.needsUpdate=true; }
 }
 
@@ -1372,10 +1393,30 @@ function updateEnemies(dt){
     const g=e.root, p=g.position;
     if(e.flash>0) e.flash=Math.max(0,e.flash-dt*5);
     for(const m of e.actor.mats) if(m.emissive) m.emissive.setRGB(e.flash*0.6,e.flash*0.08,e.flash*0.05);
-    if(e.stunT>0){ e.stunT-=dt; g.rotation.y+=Math.sin(performance.now()*0.008)*dt*2; e.los=false; e.losT=0; e.actor.update(dt,{moving:false,speed:0,aim:0,stun:true}); continue; }
+    if(e.stunT>0){ e.stunT-=dt; e.breach=null; g.rotation.y+=Math.sin(performance.now()*0.008)*dt*2; e.los=false; e.losT=0; e.actor.update(dt,{moving:false,speed:0,aim:0,stun:true}); continue; }
     e.losT-=dt;
     if(e.losT<=0){ e.losT=0.2; _ep.set(p.x,1.55,p.z); const was=e.los; e.los=hasLOS(_ep,head); if(!was&&e.los) e.fireCd=Math.max(e.fireCd,0.45+Math.random()*0.5); }
-    for(const d of doors) if(!d.open&&Math.hypot(p.x-d.center.x,p.z-d.center.z)<0.95) openDoor(d,p);
+    if(e.breach){   // kicking a door in: hold position, face the door, foot lands KICK_HIT into the clip
+      const b=e.breach; b.t+=dt; g.rotation.y=lerpAngle(g.rotation.y,b.yaw,Math.min(1,dt*10));
+      if(!b.kicked&&b.t>=b.hitT){ b.kicked=true; kickDoor(b.door,p); }
+      const done=b.t>=b.endT||(b.door.open&&!b.kicked);
+      e.actor.update(dt,{moving:false,speed:0,aim:0,stun:false,kick:!done});
+      if(done) e.breach=null;
+      continue;
+    }
+    { // a closed door that the route goes through (or that we are stuck against): kick it in
+      const n1=e.path&&e.path[e.wp], n2=e.path&&e.path[e.wp+1];
+      for(const d of doors){
+        if(d.open||Math.hypot(p.x-d.center.x,p.z-d.center.z)>1.05) continue;
+        const sp=(p.x-d.center.x)*d.normal.x+(p.z-d.center.z)*d.normal.z;
+        const crosses=[n1,n2].some(w=>w&&((w.x-d.center.x)*d.normal.x+(w.z-d.center.z)*d.normal.z)*sp<0);
+        if(!crosses&&e.stuckT<0.4) continue;
+        if(e.actor.acts&&e.actor.acts.Kick){ const s=sp>=0?1:-1; e.breach={door:d,t:0,hitT:KICK_HIT-KICK_START,endT:KICK_END-KICK_START,yaw:Math.atan2(-d.normal.x*s,-d.normal.z*s),kicked:false}; }
+        else openDoor(d,p);
+        break;
+      }
+      if(e.breach){ e.actor.update(dt,{moving:false,speed:0,aim:0,stun:false,kick:true}); continue; }
+    }
     const toP=new V(head.x-p.x,0,head.z-p.z), dist=toP.length();
     e.repathT-=dt;
     if(e.repathT<=0||!e.path){ e.repathT=0.9+Math.random()*0.6; const goal=enemyGoal(e,head), pth=findPath(p.x,p.z,goal.x,goal.z);
@@ -1433,7 +1474,8 @@ addEventListener('keydown',e=>{ keys[e.code]=true;
   if(e.code==='KeyR') reload();
   if(e.code==='KeyQ'||e.code==='Digit1'||e.code==='Digit2'){ if(e.code==='KeyQ'||(e.code==='Digit1')!==(state.weapon==='rifle')) swapWeapon(); }
   if(e.code==='KeyG'&&state.started&&!renderer.xr.isPresenting){ const q=new T.Quaternion(), p=new V(); camera.getWorldPosition(p); camera.getWorldQuaternion(q); p.y-=0.2; throwFlash(p,new V(0,0,-1).applyQuaternion(q)); }
-  if(e.code==='KeyE'&&state.started) desktopUse(); });
+  if(e.code==='KeyE'&&state.started) desktopUse();
+  if(e.code==='KeyF') startKick(); });
 addEventListener('keyup',e=>{ keys[e.code]=false; });
 function desktopUse(){ camera.getWorldPosition(_hp); let best=null, bd=1.8; for(const d of doors){ const dd=Math.hypot(_hp.x-d.center.x,_hp.z-d.center.z); if(dd<bd){ bd=dd; best=d; } } if(!best) return; if(best.open){ closeDoor(best); audioDoor(best.center); } else openDoor(best,_hp); }
 renderer.domElement.addEventListener('mousedown',()=>{ if(renderer.xr.isPresenting||!state.started) return; if(!pointerLocked){ try{ renderer.domElement.requestPointerLock(); }catch(e){} return; }
@@ -1489,6 +1531,56 @@ const audioStep=A((p,run)=>{ const t=audioCtx.currentTime, d=at(new V(p.x,0.05,p
 const audioBodyFall=A(p=>{ const t=audioCtx.currentTime+0.45, d=at(new V(p.x,0.2,p.z)); noise(t,0.18,220,0.8,0.9,'lowpass',d); tone(t,'sine',90,40,0.15,0.5,d); });
 const audioHitGrunt=A(p=>{ const t=audioCtx.currentTime, d=at(new V(p.x,1.6,p.z)); tone(t,'sawtooth',rr(130,170),rr(90,110),0.18,0.18,d); noise(t,0.12,700,2,0.12,'bandpass',d); });
 
+/* ============================== PLAYER FRONT KICK ============================== */
+// Left stick click / F. A boot comes up into view, the head rises ~5 cm through the swing (kept small for VR comfort),
+// and at the strike a closed door in front slams open or an enemy in reach is staggered back.
+const kick={t:-1,cd:0,hit:false};
+const matTrousers=new T.MeshStandardMaterial({color:lin(0x4b4d3c),roughness:0.92}), matBoot=new T.MeshStandardMaterial({color:lin(0x2b2621),roughness:0.55,metalness:0.1});
+const legRoot=new T.Group(), hipP=new T.Group(), kneeP=new T.Group();
+legRoot.add(hipP); hipP.add(kneeP); hipP.position.set(0.11,0.9,0); kneeP.position.set(0,-0.42,0);
+(function buildLeg(){
+  const thigh=new T.Mesh(new T.CapsuleGeometry(0.075,0.3,4,10),matTrousers); thigh.position.y=-0.21; hipP.add(thigh);
+  const shin=new T.Mesh(new T.CapsuleGeometry(0.06,0.3,4,10),matTrousers); shin.position.y=-0.2; kneeP.add(shin);
+  const pad=new T.Mesh(new T.BoxGeometry(0.1,0.12,0.045),matBoot); pad.position.set(0,-0.03,-0.065); kneeP.add(pad);
+  const boot=new T.Mesh(new T.BoxGeometry(0.11,0.12,0.29),matBoot); boot.position.set(0,-0.44,-0.07); kneeP.add(boot);
+  const sole=new T.Mesh(new T.BoxGeometry(0.115,0.025,0.3),matDark); sole.position.set(0,-0.505,-0.07); kneeP.add(sole);
+  legRoot.traverse(o=>{ if(o.isMesh) o.castShadow=true; });
+})();
+legRoot.visible=false; scene.add(legRoot);
+function startKick(){ if(kick.t>=0||kick.cd>0||!state.started||state.over) return; if(!audioCtx) initAudio(); kick.t=0; kick.hit=false; audioKickSwing(); }
+const _kq=new T.Quaternion(), _kf=new V();
+function updatePlayerKick(dt){
+  if(kick.cd>0) kick.cd-=dt;
+  if(kick.t<0){ kickLift=0; return; }
+  kick.t+=dt; const t=kick.t;
+  kickLift=0.05*Math.sin(Math.PI*Math.min(t,0.6)/0.6);
+  let hip,knee;
+  if(t<0.22){ const u=t/0.22; hip=1.1*u; knee=1.5*u; }                                   // chamber: knee up
+  else if(t<0.32){ const u=(t-0.22)/0.1; hip=1.1+0.25*u; knee=1.5-1.45*u; }               // snap the leg out
+  else { const u=Math.min(1,(t-0.32)/0.38); hip=1.35*(1-u); knee=0.05*(1-u)+0.35*Math.sin(u*Math.PI); } // recover
+  camera.getWorldPosition(_hp); camera.getWorldQuaternion(_kq);
+  _kf.set(0,0,-1).applyQuaternion(_kq); _kf.y=0; if(_kf.lengthSq()<1e-6) _kf.set(0,0,-1); _kf.normalize();
+  legRoot.position.set(_hp.x,0,_hp.z); legRoot.rotation.y=Math.atan2(-_kf.x,-_kf.z);
+  hipP.position.y=Math.max(0.6,_hp.y-0.72); hipP.rotation.x=hip; kneeP.rotation.x=-knee; legRoot.visible=true;
+  if(!kick.hit&&t>=0.3){ kick.hit=true; kickStrike(_hp.clone(),_kf.clone()); }
+  if(t>=0.7){ kick.t=-1; kick.cd=0.25; legRoot.visible=false; kickLift=0; }
+}
+function kickStrike(head,fwd){
+  for(const c of controllers) pulse(c,0.8,80);
+  let best=null, bd=1.45;
+  for(const d of doors){ if(d.open) continue; const dx=d.center.x-head.x, dz=d.center.z-head.z, dist=Math.hypot(dx,dz);
+    if(dist<bd&&(dx*fwd.x+dz*fwd.z)>0.45*dist){ best=d; bd=dist; } }
+  if(best) kickDoor(best,head);
+  for(const e of enemies.slice()){ const dx=e.root.position.x-head.x, dz=e.root.position.z-head.z, dist=Math.hypot(dx,dz);
+    if(dist<1.5&&(dx*fwd.x+dz*fwd.z)>0.5*dist){
+      e.hp-=20; e.flash=1; if(e.actor) e.actor.flinch=1; e.breach=null; e.stunT=Math.max(e.stunT,1.0);
+      e.root.position.addScaledVector(fwd,0.35); collideXZ(e.root.position,0.22,0); audioKickHit(e.root.position);
+      if(e.hp<=0) killEnemy(e,fwd.clone()); } }
+}
+const audioKickSwing=A(()=>{ const t=audioCtx.currentTime; noise(t+0.12,0.18,600,0.7,0.25,'bandpass'); });
+const audioKickDoor=A(p=>{ const t=audioCtx.currentTime, d=at(p); noise(t,0.12,160,0.7,1.2,'lowpass',d); tone(t,'sine',70,35,0.2,0.9,d); noise(t+0.01,0.08,2200,1.2,0.6,'bandpass',d); noise(t+0.33,0.15,240,0.8,0.7,'lowpass',d); });
+const audioKickHit=A(p=>{ const t=audioCtx.currentTime, d=at(new V(p.x,1.1,p.z)); noise(t,0.1,300,0.8,0.9,'lowpass',d); tone(t,'sine',110,50,0.12,0.6,d); });
+
 /* ============================== HUD PLACEMENT + MIRROR ============================== */
 function updateHUDPlacement(){
   const off=offCtrl(), g=off?off.userData.grip:(grips[1]||grips[0]);
@@ -1515,7 +1607,7 @@ function step(dt){
       if(state.nextWaveT>0){ state.nextWaveT-=dt; if(state.nextWaveT<=0) startWave(); }
       updateEnemies(dt); updateGrenades(dt);
     } else { moveTarget=0; if(!xr) desktopUpdate(0); }
-    updateCorpses(dt);
+    updateCorpses(dt); updatePlayerKick(dt);
     playerPhysics(dt); updateDoors(dt);
   }
   updateGunPose(dt); updateEffects(dt); updateListener();
@@ -1548,7 +1640,7 @@ enterVRBtn.addEventListener('click',async()=>{
   }catch(err){ xrStatus.textContent='Could not start VR: '+(err&&err.message?err.message:err); }
 });
 desktopBtn.addEventListener('click',()=>{ if(!audioCtx) initAudio(); overlay.style.display='none'; desktopChrome(true); beginGame(); try{ renderer.domElement.requestPointerLock(); }catch(e){} });
-window.__bp={T,state,enemies,civs,corpses,doors,colliders,findPath,navBlocked,NAV_N,dolly,scene,renderer,camera,step,throwFlash,killEnemy,hitCiv,WEAPONS,MODELS,ROOMS,swapWeapon,decalIM,poolIM,spawnCiv,spawnEnemy,fireOnce}; // debug handle for testing
+window.__bp={T,state,enemies,civs,corpses,doors,colliders,findPath,navBlocked,NAV_N,dolly,scene,renderer,camera,step,throwFlash,killEnemy,hitCiv,WEAPONS,MODELS,ROOMS,swapWeapon,decalIM,poolIM,spawnCiv,spawnEnemy,fireOnce,startKick,kick,legRoot,kickDoor,getKick:()=>KICK_CLIP}; // debug handle for testing
 </script>
 
 </body>
